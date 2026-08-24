@@ -5,169 +5,156 @@ import string
 import uuid
 import os
 import base64
+import logging
 from datetime import datetime
 
 app = Flask(__name__)
 
+# Log everything to figure out what URL game wants
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.INFO)
+
 # ════════════════════════
-# REAL GARENA CONFIG FORMAT
+# GUEST SYSTEM
 # ════════════════════════
 
 class GuestSystem:
     def __init__(self):
         self.guests = {}
-        self.resets_today = 0
-
-    def generate_identity(self):
-        prefixes = ['hwid_samsung_','hwid_xiaomi_','hwid_realme_',
-                     'hwid_oneplus_','hwid_poco_','hwid_vivo_']
-        return {
-            'guest_id': f"guest_{uuid.uuid4().hex[:16]}",
-            'hwid': f"{random.choice(prefixes)}{''.join(random.choices(string.hexdigits[:16],k=8))}",
-            'android_id': base64.b64encode(os.urandom(8)).decode().replace('=','').replace('/','0'),
-            'device_brand': random.choice(['Samsung','Xiaomi','realme','OnePlus','POCO']),
-            'device_model': random.choice(['SM-A145F','M2010J19SG','RMX3085']),
-            'android_ver': random.choice(['11','12','13']),
-        }
-
     def register(self):
-        ident = self.generate_identity()
-        self.guests[ident['guest_id']] = ident
-        return ident
+        i = {'guest_id':f"g_{uuid.uuid4().hex[:12]}",
+             'hwid':f"hwid_{''.join(random.choices(string.hexdigits[:16],k=8))}",
+             'brand':random.choice(['Samsung','Xiaomi','OnePOCO']),
+             'model':random.choice(['A14','Note11','F5'])}
+        self.guests[i['guest_id']] = i
+        return i
+    def reset(self, gid):
+        if gid in self.guests: del self.guests[gid]
+        n = self.register()
+        return {'old':gid,'new':n}
 
-    def reset(self, old_gid):
-        if old_gid in self.guests:
-            del self.guests[old_gid]
-        new = self.register()
-        self.resets_today += 1
-        return {'old': old_gid, 'new': new}
-
-guest_sys = GuestSystem()
+guest = GuestSystem()
 
 # ════════════════════════
-# THE ACTUAL CONFIG FF EXPECTS
+# THE CONFIG — MIMICS REAL GARENA RESPONSE  
 # ════════════════════════
 
-def build_real_config():
-    """
-    Real Free Fire config JSON format.
-    This mimics official Garena config server response.
-    """
-    return {
+@app.after_request
+def fix_headers(r):
+    r.headers['Access-Control-Allow-Origin'] = '*'
+    r.headers['Content-Type'] = 'application/json'
+    r.headers['Cache-Control'] = 'no-store'
+    return r
+
+def make_cfg(requested_path):
+    """Clean minimal config that looks legit to the game"""
+    
+    ts = int(time.time() * 1000)
+    
+    # Try multiple formats - one of them WILL match
+    cfg = {
+        # Format 1: Standard Garena style
+        "ret": 0,
+        "msg": "success",
+        "data": {
+            "version": "2.95.1",
+            "versionCode": 29512047,
+            "forceUpdate": False,
+            "maintenance": False,
+            "downloadUrl": "",
+            "updateDesc": "",
+            "cdnUrl": "https://static.ff.garena.com/",
+            
+            # This is where modded APK reads features from
+            "configData": {
+                "features": {
+                    "esp": 1,
+                    "aimbot": 1, 
+                    "norecoil": 1,
+                    "fakehs": 1,
+                    "speed": 107,
+                    "antenna": 1,
+                    "itemesp": 1
+                },
+                "menu": {"name":"[ONYX]","v":"5.0"},
+                "safe": {"ss":1,"cloak":1}
+            },
+            
+            "servers": [
+                {"name":"IN-1","ip":"149.28.148.212","port":8443,"load":20},
+                {"name":"IN-2","ip":"45.77.56.98","port":8443,"load":35}
+            ],
+            
+            "announce": {"title":"","content":"","url":""},
+            "events": [],
+            
+            "time": ts
+        },
+        
+        # Also put stuff at root level in case it reads flat
+        "ret": 0,
+        "msg": "success", 
         "version": "2.95.1",
         "code": 200,
         "status": "ok",
+        "timestamp": ts,
         
-        # Game reads these directly
-        "gameConfig": {
-            "region": "IN",
-            "maintenance": False,
-            "forceUpdate": False,
-            "latestVersion": "2.95.1",
-            "downloadUrl": "",
-            
-            # Feature flags (what mod loaders hook into)
-            "featureFlags": {
-                "esp_enabled": True,
-                "aimbot_enabled": True,
-                "norecoil_enabled": True,
-                "fake_hs_enabled": True,
-                "speedhack_enabled": True,
-                "antiban_enabled": True,
-                "menu_version": "4.3",
-                "menu_name": "[ O N Y X ]"
-            },
-            
-            # Mod payload (this gets loaded by modded APK)
-            "modPayload": {
-                "combat": {
-                    "aimbot": {"active": 1, "fov": 90, "smooth": 3, "silent": 1},
-                    "fakeHS": {"active": 1, "visualOnly": 1, "rate": 65},
-                    "noRecoil": 1,
-                    "noSpread": 1
-                },
-                "visual": {
-                    "esp": {"active": 1, "box": 1, "hp": 1, "name": 1, "dist": 1, "line": 1},
-                    "antenna": 1,
-                    "itemEsp": 1
-                },
-                "player": {"speed": 107, "noFallDmg": 1},
-                "safe": {"ssClean": 1, "cloakStats": 1, "shadowAuto": 1}
-            }
-        },
-        
-        # Standard Garena fields (required for game to proceed)
-        "cdnUrls": {
-            "resourceBase": "https://static.ff.garena.com/",
-            "configBase": "https://static.ff.garena.com/config/"
-        },
-        "servers": [
-            {"region": "IN", "ip": "game.ff.garena.com", "port": 8443, "load": 30}
-        ],
-        "announce": "",
-        "announceUrl": "",
-        "eventList": [],
-        
-        # Timestamp for freshness check
-        "timestamp": int(time.time() * 1000)
+        # Mod-specific flat keys (many simple loaders read these)
+        "esp": 1,
+        "aimbot": 1,
+        "norecoil": 1,
+        "fakehs": 1,
+        "menu_name": "[ O N Y X ]"
     }
-
-
-@app.after_request
-def add_headers(response):
-    """Fix CORS and content-type for game compatibility"""
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, HEAD'
-    response.headers['Access-Control-Allow-Headers'] = '*'
-    response.headers['Content-Type'] = 'application/json; charset=utf-8'
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    return response
-
+    
+    return cfg
 
 # ════════════════════════
-# CATCH ALL + SPECIFIC ROUTES  
+# CATCH ALL — LOGS EVERY REQUEST + RETURNS CONFIG
 # ════════════════════════
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=['GET', 'POST', 'HEAD', 'OPTIONS'])
 def catch_all(path):
-    """Every single URL returns valid config"""
     
-    print(f"[{datetime.utcnow().isoformat()}] {request.method} /{path} | {request.remote_addr}")
+    now = datetime.utcnow().strftime('%H:%M:%S')
+    method = request.method
+    full_path = f'/{path}' if path else '/'
     
-    cfg = build_real_config()
-    cfg['_requested_path'] = '/' + path if path else '/'
+    # === LOG IT SO WE CAN SEE ===
+    print(f"\n[{now}] {method} {full_path}")
+    print(f"   Headers: User-Agent = {request.headers.get('User-Agent','?')}")
+    print(f"   Query: {dict(request.args)}")
+    if request.data:
+        print(f"   Body: {request.data[:200]}")
+    
+    # Build and return config
+    cfg = make_cfg(full_path)
+    cfg['_debug'] = {'path': full_path, 'hits': True}
     
     resp = make_response(jsonify(cfg))
     resp.status_code = 200
     return resp
 
-
 @app.route('/api/guest_register', methods=['POST'])
-def guest_register():
-    ident = guest_sys.register()
-    return jsonify({"code": 200, "msg": "OK", "data": ident})
+def reg():
+    return jsonify({"code":200,"msg":"OK","data":guest.register()})
 
 @app.route('/api/guest_reset', methods=['POST'])
-def guest_reset():
-    data = request.get_json() or {}
-    old_gid = data.get('guestId') or data.get('guest_id') or ''
-    result = guest_sys.reset(old_gid)
-    ni = result['new']
-    return jsonify({
-        "code": 200, "msg": "RESET_OK",
-        "data": ni,
-        "_note": "Update HWID in localconfig.json then restart"
-    })
+def reset():
+    d=request.get_json() or {}
+    r=guest.reset(d.get('guestId',''))
+    return jsonify({"code":200,"msg":"RESET","data":r['new']})
 
 @app.route('/ping')
 def ping():
-    return jsonify({"alive": True, "ts": time.time(), "svc": "onyx_v5"})
-
-@app.route('/health')
-def health():
-    return jsonify({"ok": True, "g": len(guest_sys.guests), "ts": time.time()})
+    return jsonify({"alive":True,"ts":time.time()})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    p=int(os.environ.get('PORT',5000))
+    print("="*50)
+    print("  ONYX v5 — FULL CATCH ALL")
+    print("  All paths logged. Check Render Logs.")
+    print("="*50)
+    app.run('0.0.0.0',p)
