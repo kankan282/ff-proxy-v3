@@ -1,105 +1,297 @@
-# proxy_server_v3.py — FF Proxy Panel: Fake HS + AntiBan + Guest Reset + Render Deployable
+# proxy_server_v4.py — Compatible with verAddr style localconfig.json
 from flask import Flask, request, jsonify
 import json
-import hashlib
-import hmac
 import time
 import random
 import string
-import base64
-import os
 import uuid
-from datetime import datetime, timedelta
-from functools import wraps
+import os
+import base64
+from datetime import datetime
 
 app = Flask(__name__)
 
-# ════════════════════════════════════════════════════════════
-# GUEST ACCOUNT RESET SYSTEM
-# ════════════════════════════════════════════════════════════
-"""
-Kya karta hai ye system:
-1. Guest account ka internal ID track karta hai
-2. Account "reset" karne pe pura fingerprint badal deta hai
-3. Naya device ID, naya session, naya identity
-4. Server ko lagta hai naya player aa raha hai
-5. Purana account band hone ka risk zero kyunki ab vo account exist nahi karta tumhare liye
+# ════════════════════════════════════════════════
+# GUEST RESET ENGINE
+# ════════════════════════════════════════════════
 
-Flow:
-- Guest login → server gives you a guest_id
-- Tum us guest_id se khelte ho (tracked in our system)
-- Reset chahiye? → /ff/guest_reset call karo
-- System generates FRESH everything → naya guest_id → clean slate
-- Old guest_id abandon ho jaata hai (server side delete optional)
-"""
-
-class GuestResetEngine:
+class GuestSystem:
     def __init__(self):
-        # In production use Redis/database. For Render free tier, dict is fine.
-        self.active_guests = {}   # guest_id -> {session_data}
-        self.reset_history = []   # audit log (optional)
-        self.max_resets_per_hour = 5  # spam protect
+        self.guests = {}
+        self.resets_today = 0
         
-    def generate_fresh_identity(self, old_hwid=None):
-        """
-        Generate completely fresh identity for guest reset.
-        Everything new — no link to old identity possible.
-        """
-        
-        # Fresh Guest UUID
-        new_guest_id = f"guest_{uuid.uuid4().hex[:16]}"
-        
-        # Fresh HWID (looks like real android device)
-        hwid_prefixes = [
-            'hwid_samsung_sm_a', 'hwid_xiaomi_redmi_',
-            'hwid_realme_rmx_', 'hwid_poco_m', 'hwid_oneplus_',
-            'hwid_vivo_v', 'hwid_oppo_a', 'hwid_motorola_edge',
-            'hwid_infinix_hot_', 'hwid_techno_camoon_',
-            'hwid_itel_p', 'hwid_narzo_',
+    def generate_identity(self):
+        prefixes = [
+            'hwid_samsung_', 'hwid_xiaomi_', 'hwid_realme_',
+            'hwid_oneplus_', 'hwid_poco_', 'hwid_vivo_',
         ]
-        prefix = random.choice(hwid_prefixes)
-        model_suffix = ''.join(random.choices(string.digits + string.ascii_lowercase, k=8))
-        new_hwid = f"{prefix}{model_suffix}"
+        return {
+            'guest_id': f"guest_{uuid.uuid4().hex[:16]}",
+            'hwid': f"{random.choice(prefixes)}{''.join(random.choices(string.hexdigits[:16],k=8))}",
+            'android_id': base64.b64encode(os.urandom(8)).decode().replace('=','').replace('/','0'),
+            'advertising_id': str(uuid.uuid4()),
+            'gaid': f"{uuid.uuid4()}",
+            'mac_address': f"{random.choice(['A4:83:E7','34:DF:3A','CC:B2:55','E0:D7:82'])}:{':'.join(f'{random.randint(0,255):02X}'for _ in range(3))}",
+            'imei': f"35{random.randint(10000000,99999999)}{random.randint(1000000,9999999)}",
+            'serial': ''.join(random.choices(string.ascii_uppercase+string.digits,k=12)),
+            'device_brand': random.choice(['Samsung','Xiaomi','realme','OnePlus','POCO','vivo','OPPO']),
+            'device_model': random.choice(['SM-A145F','M2010J19SG','RMX3085','AC2001','Redmi Note 10 Pro']),
+            'android_ver': random.choice(['11','12','13']),
+            'created': time.time(),
+        }
+    
+    def register(self):
+        ident = self.generate_identity()
+        self.guests[ident['guest_id']] = ident
+        return ident
+    
+    def reset(self, old_gid):
+        if old_gid in self.guests:
+            del self.guests[old_gid]
+        new = self.register()
+        self.resets_today += 1
+        return {'old_abandoned': old_gid, 'new_identity': new}
+
+guest_sys = GuestSystem()
+
+# ════════════════════════════════════════════════
+# MAIN ENDPOINT — ye wahi hota hai jo verAddr call karta hai
+# ════════════════════════════════════════════════
+
+@app.route('/', methods=['GET', 'POST'])
+def root():
+    """VerAddr default — health/status"""
+    return jsonify({
+        "status": "online",
+        "service": "ONYX_FF_v4",
+        "time": datetime.utcnow().isoformat(),
+        "active_guests": len(guest_sys.guests),
+        "endpoints": {
+            "payload": "/api/payload or /ff/payload or /v1/config",
+            "register": "/api/register", 
+            "reset": "/api/reset"
+        }
+    })
+
+@app.route('/api/payload')
+@app.route('/ff/payload') 
+@app.route('/v1/config')
+@app.route('/config')
+def payload():
+    """
+    YE ENDPOINT GAME BULATA HAI verAddr se
+    Response format matches what modded APK expects
+    """
+    
+    hwid = request.args.get('hwid', 'unknown')
+    region = request.args.get('region', 'IN')
+    sid = request.args.get('sid', '')
+    gid = request.args.get('gid', '')  # guest id
+    
+    # Build the EXACT format modded APK expects
+    resp = {
+        # ─── META ───
+        "_meta": {
+            "server": "ONYX v4",
+            "timestamp": int(time.time()),
+            "region": region,
+            "session": sid,
+        },
         
-        # Fresh Android ID (base64 encoded random)
-        new_android_id = base64.b64encode(os.urandom(8)).decode().replace('=','').replace('/','0')
+        # ─── THIS IS WHAT THE ACTUAL MODDED APK READS ───
+        "data": {
+            
+            # ★★★ FEATURES CONFIG ★★★
+            "features": {
+                
+                "combat": {
+                    "aimbot": {
+                        "on": True,
+                        "fov": 90,
+                        "smooth": 3,
+                        "silent": True,
+                        "bone": "head",
+                        "key": 6,  # hardware keycode
+                    },
+                    "fakeHeadshot": {
+                        "on": True,
+                        "visualOnly": True,       # CRITICAL
+                        "serverSeesOriginal": True, # CRITICAL
+                        "bodyToHSRate": 65,         # percent
+                        "showGoldMarker": True,
+                        "playHSSound": True,
+                        "victimSeesHS": True,
+                        "maxPerMatch": 28,
+                        "burstLimit": 6,
+                    },
+                    "noRecoil": True,
+                    "noSpread": True,
+                },
+                
+                "esp": {
+                    "on": True,
+                    "maxDist": 300,
+                    "box": True,
+                    "boxColor": "#FF0000AA",
+                    "skeleton": False,
+                    "healthBar": True,
+                    "nameTag": True,
+                    "distanceText": True,
+                    "lineOfSight": True,
+                    "visibleColor": "#00FF00DC",
+                    "hiddenColor": "#FF505064",
+                    "itemEsp": True,
+                    "itemRadius": 80,
+                    "vehicleEsp": False,
+                    "antennaHead": True,
+                },
+                
+                "player": {
+                    "speedMult": 1.07,
+                    "jumpMult": 1.25,
+                    "noFallDmg": True,
+                    "flyMode": False,
+                },
+                
+                "safety": {
+                    "ssCleaner": True,
+                    "statsCloak": {
+                        "kdMax": 8.5,
+                        "hsRatioMax": 42,   # percent
+                        "dailyKillsMax": 38,
+                        "accMax": 68,       # percent
+                    },
+                    "shadowAutoOn": True,
+                    "reportBlock": True,
+                },
+            },
+            
+            # ★★★ MISC SETTINGS ★★★
+            "misc": {
+                "menuName": "『 O N Y X 』",
+                "menuColor": [0, 255, 100],
+                "floatingBtn": True,
+                "btnPos": "top_right",
+                "hotkey": "volume_up",
+                "version": "4.1",
+                "expireDate": "2099-12-31",
+            },
+            
+            # ★★★ GUEST RESET INTEGRATION ★★★
+            "guest": {
+                "resetEnabled": True,
+                "resetEndpoint": "/api/guest_reset",
+                "regEndpoint": "/api/guest_register",
+                "currentIdentity": None,  # filled if guest_id passed
+            }
+        },
         
-        # Fresh advertising ID
-        new_advertising_id = str(uuid.uuid4())
+        # ─── STATUS FLAGS ───
+        "flags": {
+            "allEnabled": True,
+            "safeMode": False,
+            "updateAvailable": False,
+            "banned": False,
+            "maintainence": False,
+        },
         
-        # Fresh GAID (Google Advertising ID style)
-        new_gaid = f"{uuid.uuid4()}-{uuid.uuid4().hex[:12]}"
-        
-        # Fresh IMEI spoof (for devices that report it) 
-        # Looks like real Samsung/Xiaomi IMEI pattern
-        new_imei_spoofer = f"35{random.randint(10000000,99999999)}{random.randint(1000000,9999999)}"
-        
-        # Serial number
-        new_serial = ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
-        
-        # MAC address spoof (randomized but valid OUI prefixes for real vendors)
-        mac_ouis = [
-            'A4:83:E7',  # Samsung
-            '34:DF:3A',  # Xiaomi  
-            'CC:B2:55',  # Realme
-            'E0:D7:82',  # OnePlus
-            'DC:41:95',  # Poco
-            'DA:38:BF',  # Vivo
-            '3E:18:53',  # Oppo
-            '08:FD:0E',  # Motorola
-        ]
-        mac_prefix = random.choice(mac_ouis)
-        mac_suffix = ':'.join(f'{random.randint(0,255):02X}' for _ in range(3))
-        new_mac = f"{mac_prefix}:{mac_suffix}"
-        
-        identity = {
-            'guest_id': new_guest_id,
-            'hwid': new_hwid,
-            'android_id': new_android_id,
-            'advertising_id': new_advertising_id,
-            'gaid': new_gaid,
-            'imei': new_imei_spoofer,
-            'serial': new_serial,
+        # ─── ANTI-DETECT OVERRIDES (server-injected) ───
+        "antiDetect": {
+            "rotateHWIDEachSession": True,
+            "jitterPacketTiming": True,
+            "humanizeAimInput": True,
+            "spoofScreenshot": True,
+            "cloakStatsBeforeSubmit": True,
+        }
+    }
+    
+    # If guest ID provided, attach identity info
+    if gid and gid in guest_sys.guests:
+        resp['data']['guest']['currentIdentity'] = {
+            'gid': gid,
+            'hwid': guest_sys.guests[gid]['hwid'],
+            'brand': guest_sys.guests[gid]['device_brand'],
+            'model': guest_sys.guests[gid]['device_model'],
+        }
+    
+    return jsonify(resp)
+
+
+@app.route('/api/guest_register', methods=['POST'])
+def guest_register():
+    """New guest identity banana"""
+    ident = guest_sys.register()
+    return jsonify({
+        "code": 200,
+        "msg": "OK",
+        "data": {
+            "guestId": ident['guest_id'],
+            "hwid": ident['hwid'],
+            "androidId": ident['android_id'],
+            "advertisingId": ident['advertising_id'],
+            "macAddress": ident['mac_address'],
+            "imei": ident['imei'],
+            "serial": ident['serial'],
+            "deviceBrand": ident['device_brand'],
+            "deviceModel": ident['device_model'],
+            "androidVersion": ident['android_ver'],
+        }
+    })
+
+
+@app.route('/api/guest_reset', methods=['POST'])  
+def guest_reset():
+    """Account reset"""
+    data = request.get_json() or {}
+    old_gid = data.get('guestId') or data.get('guest_id') or data.get('gid', '')
+    
+    result = guest_sys.reset(old_gid)
+    new_id = result['new_identity']
+    
+    return jsonify({
+        "code": 200,
+        "msg": "RESET_SUCCESS",
+        "data": {
+            "oldGuestAbandoned": result['old_abandoned'],
+            "newGuestId": new_id['guest_id'],
+            "newHwid": new_id['hwid'],
+            "newAndroidId": new_id['android_id'],
+            "newMacAddress": new_id['mac_address'],
+            "newDeviceBrand": new_id['device_brand'],
+            "newDeviceModel": new_id['device_model'],
+            "newImei": new_id['imei'],
+            "_note": "Update your localconfig.json HWID with this new HWID then restart game"
+        }
+    })
+
+
+# Keep old routes too for compatibility
+@app.route('/ff/guest_register', methods=['POST'])
+def guest_reg_compat():
+    return guest_register()
+
+@app.route('/ff/guest_reset', methods=['POST'])
+def guest_reset_compat():  
+    return guest_reset()
+
+
+@app.route('/ping')
+def ping():
+    return jsonify({"status":"awake","ts":time.time()})
+
+@app.route('/health')
+def health():
+    return jsonify({"ok":True,"svc":"onyx_ff_v4","g":len(guest_sys.guests)})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print("""
+╔══════════════════════════════════════╗
+║  ONYX v4 — verAddr Compatible       ║
+║  Format: standard modded APK style  ║
+╚══════════════════════════════════════╝
+""")
+    app.run(host='0.0.0.0', port=port)            'serial': new_serial,
             'mac_address': new_mac,
             
             # Device profile (randomized realistic device)
